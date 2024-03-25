@@ -18,12 +18,10 @@
 static DWORD start;
 static FILE *logfile = NULL;
 
-
-
 #define logf(fmt,...) do {                                            \
-    fprintf(stderr, "%u: " fmt "\n", GetTickCount() - start,##__VA_ARGS__);   \
+    fprintf(stderr, "%u|%u| " fmt "\n", GetTickCount() - start, GetCurrentThreadId(), ##__VA_ARGS__); \
     fflush(stderr);                                                   \
-    fprintf(logfile, "%u: " fmt "\n", GetTickCount() - start, ##__VA_ARGS__); \
+    fprintf(logfile, "%u|%u| " fmt "\n", GetTickCount() - start, GetCurrentThreadId(), ##__VA_ARGS__); \
     fflush(logfile);                                                  \
 } while (0)
 
@@ -35,6 +33,59 @@ static FILE *logfile = NULL;
 #define WM_USER_SHELL_NOTIFY WM_USER
 #define NOTIFY_ICON_ID 0
 #define IDC_QUIT 8
+
+static void update_text(HWND textwnd, HWINEVENTHOOK hook)
+{
+    const WCHAR *text = hook ? L"Background" : L"Foreground";
+    LRESULT result = SendMessageW(textwnd, WM_SETTEXT, 0, (LPARAM)text);
+    if (result == 0)
+        fatal("WM_SETTEXT failed, result=%lld", result);
+}
+
+static HWND global_hwnd = NULL;
+static HWND global_textwnd = NULL;
+static HWINEVENTHOOK global_winevent_hook = NULL;
+
+static void on_win_event(
+  HWINEVENTHOOK hWinEventHook,
+  DWORD event,
+  HWND hwnd,
+  LONG idObject,
+  LONG idChild,
+  DWORD idEventThread,
+  DWORD dwmsEventTime
+) {
+    if (hWinEventHook != global_winevent_hook) abort();
+    if (event != EVENT_SYSTEM_FOREGROUND) abort();
+
+    BOOL is_our_window = (hwnd == global_hwnd);
+    if (is_our_window) {
+        // I've never seen this happen, if it did happen
+        // we should be able to uninstall our hook because
+        // now we'll get the proper window message when the
+        // user clicks away from our window
+        logf("Ignoring WinEvent cause it's our window");
+        // abort left in just so I can know if this every happens
+        abort();
+    } else {
+        logf(
+            "WinEventHook hwnd=0x%zx id=%d child=%d thread=%u",
+            (size_t)hwnd,
+            is_our_window,
+            idObject,
+            idChild,
+            idEventThread
+        );
+        // TODO: is there an API to deactivate the window instead?
+        BOOL was_visible = ShowWindow(global_hwnd, SW_HIDE);
+        logf("hide window from winevent hook (was_visible=%d)", !!was_visible);
+    }
+
+    if (!UnhookWinEvent(hWinEventHook))
+        fatal("UnhookWinEvent failed, error=%u", GetLastError());
+    global_winevent_hook = NULL;
+    update_text(global_textwnd, global_winevent_hook);
+}
 
 static void show_window(HWND hWnd, POINT pt)
 {
@@ -63,21 +114,38 @@ static void show_window(HWND hWnd, POINT pt)
     ))
         fatal("SetWindowPos failed, error=%d", GetLastError());
 
-    // SetForegroundWindow doesn't say that it sets the last error
-    // when it fails so we reset the last error here so we can look at
-    // it's value anyway
-    SetLastError(0);
+    if (!SetForegroundWindow(hWnd)) {
+        // If SetForegroundWindow fails, then it means the OS won't curently
+        // allow us to take the input focus.  This is important for the popup window
+        // because without input focus, we won't receive any messages that tell us
+        // when the user has clicked away from our window so we can know to hide it again.
+        //
+        // As a fallback, we install a "WinEventHook" that tells us whenever the system foreground
+        // window changes, and we can then close the window if another window comes to the
+        // foreground.  This isn't perfect but it seems to be the best solution thus far.
+        logf("SetForegroundWindow failed");
 
-    // We only show the popup if we're able to make ourselves the
-    // "active" window (with input focus), otherwise, we will never get any window message
-    // when the user clicks away from the popup window which means we
-    // can't hide it, which feels very weird for the user.
-    if (0 == SetForegroundWindow(hWnd)) {
-        DWORD error = GetLastError();
-        logf("SetForegroundWindow failed, error=%d", error);
-        messageboxf("Error", "error: SetForegroundWindow failed, error=%u", error);
-        return;
+        if (!global_winevent_hook) {
+            global_winevent_hook = SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_FOREGROUND,
+                NULL,
+                on_win_event, // callback function
+                0, // all processes
+                0, // all threads
+                WINEVENT_OUTOFCONTEXT
+            );
+            if (!global_winevent_hook)
+                fatal("SetWinEventHook failed, error=%u", GetLastError());
+        }
+    } else {
+        if (global_winevent_hook) {
+            if (!UnhookWinEvent(global_winevent_hook))
+                fatal("UnhookWinEvent failed, error=%u", GetLastError());
+            global_winevent_hook = NULL;
+        }
     }
+    update_text(global_textwnd, global_winevent_hook);
 
     BOOL was_visible = ShowWindow(hWnd, SW_SHOW);
     logf("show window (was_visible=%d)", !!was_visible);
@@ -85,6 +153,16 @@ static void show_window(HWND hWnd, POINT pt)
 
 LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
+    if (global_winevent_hook) {
+        if (hWnd == GetForegroundWindow()) {
+            logf("removing winevent hook because we're now the foreground window (msg=%u)", uMsg);
+            if (!UnhookWinEvent(global_winevent_hook))
+                fatal("UnhookWinEvent failed, error=%u", GetLastError());
+            global_winevent_hook = NULL;
+            update_text(global_textwnd, global_winevent_hook);
+        }
+    }
+
     switch (uMsg) {
     case WM_USER_SHELL_NOTIFY: {
         switch (LOWORD(lParam)) {
@@ -165,7 +243,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, WCHAR *pCmdLin
         }
     }
 
-    HWND hWnd = CreateWindowExW(
+    global_hwnd = CreateWindowExW(
         WS_EX_TOPMOST|WS_EX_TOOLWINDOW,
         CLASS_NAME,
         L"Popup Window", // Title
@@ -177,8 +255,23 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, WCHAR *pCmdLin
         hInstance,  // Instance handle
         NULL        // Additional application data
     );
-    if (hWnd == NULL)
+    if (global_hwnd == NULL)
         fatal("CreateWindow failed, error=%d", GetLastError());
+
+    global_textwnd = CreateWindowExW(
+        0,
+        L"STATIC",
+        L"",
+        WS_VISIBLE | WS_CHILD,
+        5, 50,
+        90, 30,
+        global_hwnd,
+        NULL,
+        NULL,
+        NULL
+    );
+    if (!global_textwnd)
+        fatal("CreateWindow for text failed, error=%u", GetLastError());
 
     if (!CreateWindowExW(
         0,
@@ -187,7 +280,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, WCHAR *pCmdLin
         WS_VISIBLE | WS_CHILD,
         25, 10,
         50, 30,
-        hWnd,
+        global_hwnd,
         (HMENU)IDC_QUIT,
         NULL,
         NULL
@@ -201,7 +294,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, WCHAR *pCmdLin
         NOTIFYICONDATAW data;
         ZeroMemory(&data, sizeof(data));
         data.cbSize = sizeof(data);
-        data.hWnd = hWnd;
+        data.hWnd = global_hwnd;
         data.uFlags = NIF_ICON | NIF_MESSAGE;
         data.hIcon = icon;
         data.uCallbackMessage = WM_USER_SHELL_NOTIFY;
@@ -214,7 +307,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, WCHAR *pCmdLin
         NOTIFYICONDATAW data;
         ZeroMemory(&data, sizeof(data));
         data.cbSize = sizeof(data);
-        data.hWnd = hWnd;
+        data.hWnd = global_hwnd;
         data.uVersion = NOTIFYICON_VERSION_4;
         data.uID = NOTIFY_ICON_ID;
         if (TRUE != Shell_NotifyIconW(NIM_SETVERSION, &data))
@@ -235,7 +328,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, WCHAR *pCmdLin
         NOTIFYICONDATAW data;
         ZeroMemory(&data, sizeof(data));
         data.cbSize = sizeof(data);
-        data.hWnd = hWnd;
+        data.hWnd = global_hwnd;
         data.uID = NOTIFY_ICON_ID;
         if (TRUE != Shell_NotifyIconW(NIM_DELETE, &data)) {
             logf("NotifyIcon: DELETE failed, error=%u", GetLastError());
